@@ -1,0 +1,411 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Compute stack — preprocess + postprocess Lambdas, SageMaker async endpoint
+  (TF-IDF + LogReg), and the S3 event wiring that connects them.
+
+Parameters:
+  Env:
+    Type: String
+  ProjectName:
+    Type: String
+  ArtifactsBucket:
+    Type: String
+  ModelArtifactKey:
+    Type: String
+  ModelVersion:
+    Type: String
+  PreprocessLambdaKey:
+    Type: String
+  PostprocessLambdaKey:
+    Type: String
+  EndpointInstanceType:
+    Type: String
+  EndpointMaxConcurrentInvocations:
+    Type: Number
+    Default: 4
+  EndpointMaxInstances:
+    Type: Number
+    Default: 2
+  LogRetentionDays:
+    Type: Number
+    Default: 30
+  InputBucketName:
+    Type: String
+  AsyncInputBucketName:
+    Type: String
+  AsyncOutputBucketName:
+    Type: String
+  ResultsTableName:
+    Type: String
+  RequestsTableName:
+    Type: String
+  SklearnFrameworkVersion:
+    Type: String
+    Default: "1.2-1"
+  PythonRuntime:
+    Type: String
+    Default: python3.11
+
+Resources:
+  ## ──────────────────────────────────────────────────────────────────────
+  ## SageMaker model + async endpoint
+  ## ──────────────────────────────────────────────────────────────────────
+  SageMakerExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProjectName}-${Env}-sm-exec
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: sagemaker.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSageMakerFullAccess
+      Policies:
+        - PolicyName: s3-async-buckets
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [s3:GetObject, s3:PutObject, s3:ListBucket, s3:DeleteObject]
+                Resource:
+                  - !Sub arn:aws:s3:::${ArtifactsBucket}
+                  - !Sub arn:aws:s3:::${ArtifactsBucket}/*
+                  - !Sub arn:aws:s3:::${AsyncInputBucketName}
+                  - !Sub arn:aws:s3:::${AsyncInputBucketName}/*
+                  - !Sub arn:aws:s3:::${AsyncOutputBucketName}
+                  - !Sub arn:aws:s3:::${AsyncOutputBucketName}/*
+
+  Model:
+    Type: AWS::SageMaker::Model
+    Properties:
+      ModelName: !Sub ${ProjectName}-${Env}-model-${ModelVersion}
+      ExecutionRoleArn: !GetAtt SageMakerExecutionRole.Arn
+      PrimaryContainer:
+        Image: !Sub 683313688378.dkr.ecr.${AWS::Region}.amazonaws.com/sagemaker-scikit-learn:${SklearnFrameworkVersion}-cpu-py3
+        ModelDataUrl: !Sub s3://${ArtifactsBucket}/${ModelArtifactKey}
+        Environment:
+          SAGEMAKER_PROGRAM: inference.py
+          SAGEMAKER_SUBMIT_DIRECTORY: !Sub s3://${ArtifactsBucket}/${ModelArtifactKey}
+          SAGEMAKER_CONTAINER_LOG_LEVEL: "20"
+          SAGEMAKER_REGION: !Ref AWS::Region
+          MODEL_VERSION: !Ref ModelVersion
+
+  EndpointConfig:
+    Type: AWS::SageMaker::EndpointConfig
+    Properties:
+      EndpointConfigName: !Sub ${ProjectName}-${Env}-cfg-${ModelVersion}
+      ProductionVariants:
+        - VariantName: AllTraffic
+          ModelName: !GetAtt Model.ModelName
+          InitialInstanceCount: 1
+          InstanceType: !Ref EndpointInstanceType
+          InitialVariantWeight: 1.0
+      AsyncInferenceConfig:
+        ClientConfig:
+          MaxConcurrentInvocationsPerInstance: !Ref EndpointMaxConcurrentInvocations
+        OutputConfig:
+          S3OutputPath: !Sub s3://${AsyncOutputBucketName}/responses/
+
+  Endpoint:
+    Type: AWS::SageMaker::Endpoint
+    Properties:
+      EndpointName: !Sub ${ProjectName}-${Env}-endpoint
+      EndpointConfigName: !GetAtt EndpointConfig.EndpointConfigName
+
+  EndpointScalableTarget:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    Properties:
+      MaxCapacity: !Ref EndpointMaxInstances
+      MinCapacity: 1
+      ResourceId: !Sub endpoint/${Endpoint.EndpointName}/variant/AllTraffic
+      RoleARN: !Sub arn:aws:iam::${AWS::AccountId}:role/aws-service-role/sagemaker.application-autoscaling.amazonaws.com/AWSServiceRoleForApplicationAutoScaling_SageMakerEndpoint
+      ScalableDimension: sagemaker:variant:DesiredInstanceCount
+      ServiceNamespace: sagemaker
+
+  EndpointScalingPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: !Sub ${ProjectName}-${Env}-async-backlog
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref EndpointScalableTarget
+      TargetTrackingScalingPolicyConfiguration:
+        TargetValue: 5.0
+        CustomizedMetricSpecification:
+          MetricName: ApproximateBacklogSizePerInstance
+          Namespace: AWS/SageMaker
+          Statistic: Average
+          Dimensions:
+            - Name: EndpointName
+              Value: !Sub ${ProjectName}-${Env}-endpoint
+        ScaleInCooldown: 120
+        ScaleOutCooldown: 30
+
+  ## ──────────────────────────────────────────────────────────────────────
+  ## Preprocess Lambda
+  ## ──────────────────────────────────────────────────────────────────────
+  PreprocessLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProjectName}-${Env}-preprocess-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: preprocess-inline
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [s3:GetObject]
+                Resource: !Sub arn:aws:s3:::${InputBucketName}/*
+              - Effect: Allow
+                Action: [s3:PutObject]
+                Resource: !Sub arn:aws:s3:::${AsyncInputBucketName}/*
+              - Effect: Allow
+                Action: [sagemaker:InvokeEndpointAsync]
+                Resource: !Sub arn:aws:sagemaker:${AWS::Region}:${AWS::AccountId}:endpoint/${ProjectName}-${Env}-endpoint
+              - Effect: Allow
+                Action: [dynamodb:PutItem, dynamodb:UpdateItem]
+                Resource:
+                  - !Sub arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${RequestsTableName}
+              - Effect: Allow
+                Action: [cloudwatch:PutMetricData]
+                Resource: "*"
+
+  PreprocessLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${ProjectName}-${Env}-preprocess
+      Runtime: !Ref PythonRuntime
+      Handler: handler.lambda_handler
+      Role: !GetAtt PreprocessLambdaRole.Arn
+      Timeout: 60
+      MemorySize: 512
+      ReservedConcurrentExecutions: 50
+      Code:
+        S3Bucket: !Ref ArtifactsBucket
+        S3Key: !Ref PreprocessLambdaKey
+      Environment:
+        Variables:
+          SAGEMAKER_ENDPOINT_NAME: !Sub ${ProjectName}-${Env}-endpoint
+          ASYNC_INPUT_BUCKET: !Ref AsyncInputBucketName
+          ASYNC_OUTPUT_BUCKET: !Ref AsyncOutputBucketName
+          REQUESTS_TABLE: !Ref RequestsTableName
+          MODEL_VERSION: !Ref ModelVersion
+          ENV: !Ref Env
+          METRIC_NAMESPACE: !Sub Sentiment/${Env}
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Env
+          Value: !Ref Env
+
+  PreprocessLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${PreprocessLambda}
+      RetentionInDays: !Ref LogRetentionDays
+
+  PreprocessLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt PreprocessLambda.Arn
+      Principal: s3.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+      SourceArn: !Sub arn:aws:s3:::${InputBucketName}
+
+  InputBucketNotification:
+    Type: Custom::S3BucketNotification
+    DependsOn: PreprocessLambdaPermission
+    Properties:
+      ServiceToken: !GetAtt S3NotificationFunction.Arn
+      BucketName: !Ref InputBucketName
+      LambdaConfigurations:
+        - LambdaFunctionArn: !GetAtt PreprocessLambda.Arn
+          Events: [s3:ObjectCreated:*]
+          Filter:
+            Key:
+              FilterRules:
+                - Name: prefix
+                  Value: incoming/
+
+  ## ──────────────────────────────────────────────────────────────────────
+  ## Postprocess Lambda
+  ## ──────────────────────────────────────────────────────────────────────
+  PostprocessLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProjectName}-${Env}-postprocess-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: postprocess-inline
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [s3:GetObject]
+                Resource:
+                  - !Sub arn:aws:s3:::${AsyncOutputBucketName}/*
+                  - !Sub arn:aws:s3:::${AsyncInputBucketName}/*
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:BatchWriteItem
+                  - dynamodb:UpdateItem
+                Resource:
+                  - !Sub arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${ResultsTableName}
+              - Effect: Allow
+                Action: [cloudwatch:PutMetricData]
+                Resource: "*"
+
+  PostprocessLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${ProjectName}-${Env}-postprocess
+      Runtime: !Ref PythonRuntime
+      Handler: handler.lambda_handler
+      Role: !GetAtt PostprocessLambdaRole.Arn
+      Timeout: 60
+      MemorySize: 512
+      ReservedConcurrentExecutions: 100
+      Code:
+        S3Bucket: !Ref ArtifactsBucket
+        S3Key: !Ref PostprocessLambdaKey
+      Environment:
+        Variables:
+          RESULTS_TABLE: !Ref ResultsTableName
+          MODEL_VERSION: !Ref ModelVersion
+          ENV: !Ref Env
+          METRIC_NAMESPACE: !Sub Sentiment/${Env}
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Env
+          Value: !Ref Env
+
+  PostprocessLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${PostprocessLambda}
+      RetentionInDays: !Ref LogRetentionDays
+
+  PostprocessLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt PostprocessLambda.Arn
+      Principal: s3.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+      SourceArn: !Sub arn:aws:s3:::${AsyncOutputBucketName}
+
+  AsyncOutputBucketNotification:
+    Type: Custom::S3BucketNotification
+    DependsOn: PostprocessLambdaPermission
+    Properties:
+      ServiceToken: !GetAtt S3NotificationFunction.Arn
+      BucketName: !Ref AsyncOutputBucketName
+      LambdaConfigurations:
+        - LambdaFunctionArn: !GetAtt PostprocessLambda.Arn
+          Events: [s3:ObjectCreated:*]
+          Filter:
+            Key:
+              FilterRules:
+                - Name: prefix
+                  Value: responses/
+
+  ## ──────────────────────────────────────────────────────────────────────
+  ## Custom resource: idempotently set S3 bucket notifications.
+  ## (Avoids the AWS::S3::Bucket NotificationConfiguration circular dep
+  ## when the bucket lives in a sibling stack.)
+  ## ──────────────────────────────────────────────────────────────────────
+  S3NotificationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProjectName}-${Env}-s3notif-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: s3-notif
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetBucketNotification
+                  - s3:PutBucketNotification
+                Resource: "*"
+
+  S3NotificationFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${ProjectName}-${Env}-s3-notif
+      Runtime: !Ref PythonRuntime
+      Handler: index.handler
+      Role: !GetAtt S3NotificationRole.Arn
+      Timeout: 60
+      Code:
+        ZipFile: |
+          import json, urllib.request, boto3
+          s3 = boto3.client("s3")
+
+          def _send(event, status, data=None, reason=""):
+              body = json.dumps({
+                  "Status": status,
+                  "Reason": reason or "see CloudWatch",
+                  "PhysicalResourceId": event.get("PhysicalResourceId") or event["LogicalResourceId"],
+                  "StackId": event["StackId"],
+                  "RequestId": event["RequestId"],
+                  "LogicalResourceId": event["LogicalResourceId"],
+                  "Data": data or {},
+              }).encode()
+              req = urllib.request.Request(event["ResponseURL"], data=body, method="PUT",
+                                           headers={"content-type": "", "content-length": str(len(body))})
+              urllib.request.urlopen(req).read()
+
+          def handler(event, ctx):
+              try:
+                  props = event["ResourceProperties"]
+                  bucket = props["BucketName"]
+                  configs = [] if event["RequestType"] == "Delete" else props.get("LambdaConfigurations", [])
+                  notif = {"LambdaFunctionConfigurations": [
+                      {
+                          "LambdaFunctionArn": c["LambdaFunctionArn"],
+                          "Events": c["Events"],
+                          "Filter": c.get("Filter", {}),
+                      } for c in configs
+                  ]}
+                  s3.put_bucket_notification_configuration(Bucket=bucket, NotificationConfiguration=notif)
+                  _send(event, "SUCCESS", {"Bucket": bucket})
+              except Exception as exc:
+                  _send(event, "FAILED", reason=str(exc))
+
+Outputs:
+  EndpointName:
+    Value: !Sub ${ProjectName}-${Env}-endpoint
+  PreprocessFunctionName:
+    Value: !Ref PreprocessLambda
+  PostprocessFunctionName:
+    Value: !Ref PostprocessLambda
+  SageMakerRoleArn:
+    Value: !GetAtt SageMakerExecutionRole.Arn

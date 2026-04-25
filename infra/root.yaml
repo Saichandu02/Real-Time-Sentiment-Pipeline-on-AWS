@@ -1,0 +1,181 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Root nested stack for the serverless sentiment classification pipeline.
+  Composes storage, compute (Lambdas + SageMaker async endpoint), and
+  observability (CloudWatch alarms + tiered SNS topics) sub-stacks.
+
+Parameters:
+  Env:
+    Type: String
+    AllowedValues: [dev, staging, prod]
+    Description: Deployment environment.
+  ProjectName:
+    Type: String
+    Default: sentiment-aws
+  ArtifactsBucket:
+    Type: String
+    Description: >
+      Existing S3 bucket holding nested templates, the SageMaker model
+      artifact (model.tar.gz), and zipped Lambda packages.
+  TemplatesPrefix:
+    Type: String
+    Default: templates
+    Description: S3 prefix under ArtifactsBucket for the nested templates.
+  ModelArtifactKey:
+    Type: String
+    Description: S3 key of model.tar.gz under ArtifactsBucket.
+  ModelVersion:
+    Type: String
+    Default: v1
+  PreprocessLambdaKey:
+    Type: String
+    Description: S3 key for preprocess Lambda zip.
+  PostprocessLambdaKey:
+    Type: String
+    Description: S3 key for postprocess Lambda zip.
+  EndpointInstanceType:
+    Type: String
+    Default: ml.m5.large
+  EndpointMaxConcurrentInvocations:
+    Type: Number
+    Default: 4
+  EndpointMaxInstances:
+    Type: Number
+    Default: 2
+  LogRetentionDays:
+    Type: Number
+    Default: 30
+  DDBPointInTimeRecovery:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+  AlarmEmailP1:
+    Type: String
+    Description: Email subscriber for P1 (critical) topic.
+  AlarmEmailP2:
+    Type: String
+    Description: Email subscriber for P2 (warning) topic.
+  AlarmEmailP3:
+    Type: String
+    Default: ""
+    Description: Optional email subscriber for P3 (info) topic.
+  Endpoint5xxThresholdPct:
+    Type: Number
+    Default: 5
+  P99LatencyMsThreshold:
+    Type: Number
+    Default: 1500
+  RollingAccuracyThreshold:
+    Type: Number
+    Default: 0.78
+  DriftDeltaPpThreshold:
+    Type: Number
+    Default: 3
+  RunbookBaseUrl:
+    Type: String
+    Default: https://example.com/runbooks/sentiment
+
+Resources:
+  StorageStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub https://s3.amazonaws.com/${ArtifactsBucket}/${TemplatesPrefix}/storage.yaml
+      Parameters:
+        Env: !Ref Env
+        ProjectName: !Ref ProjectName
+        DDBPointInTimeRecovery: !Ref DDBPointInTimeRecovery
+
+  ComputeStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub https://s3.amazonaws.com/${ArtifactsBucket}/${TemplatesPrefix}/compute.yaml
+      Parameters:
+        Env: !Ref Env
+        ProjectName: !Ref ProjectName
+        ArtifactsBucket: !Ref ArtifactsBucket
+        ModelArtifactKey: !Ref ModelArtifactKey
+        ModelVersion: !Ref ModelVersion
+        PreprocessLambdaKey: !Ref PreprocessLambdaKey
+        PostprocessLambdaKey: !Ref PostprocessLambdaKey
+        EndpointInstanceType: !Ref EndpointInstanceType
+        EndpointMaxConcurrentInvocations: !Ref EndpointMaxConcurrentInvocations
+        EndpointMaxInstances: !Ref EndpointMaxInstances
+        LogRetentionDays: !Ref LogRetentionDays
+        InputBucketName: !GetAtt StorageStack.Outputs.InputBucketName
+        AsyncInputBucketName: !GetAtt StorageStack.Outputs.AsyncInputBucketName
+        AsyncOutputBucketName: !GetAtt StorageStack.Outputs.AsyncOutputBucketName
+        ResultsTableName: !GetAtt StorageStack.Outputs.ResultsTableName
+        RequestsTableName: !GetAtt StorageStack.Outputs.RequestsTableName
+
+  ObservabilityStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub https://s3.amazonaws.com/${ArtifactsBucket}/${TemplatesPrefix}/observability.yaml
+      Parameters:
+        Env: !Ref Env
+        ProjectName: !Ref ProjectName
+        EndpointName: !GetAtt ComputeStack.Outputs.EndpointName
+        ResultsTableName: !GetAtt StorageStack.Outputs.ResultsTableName
+        AlarmEmailP1: !Ref AlarmEmailP1
+        AlarmEmailP2: !Ref AlarmEmailP2
+        AlarmEmailP3: !Ref AlarmEmailP3
+        Endpoint5xxThresholdPct: !Ref Endpoint5xxThresholdPct
+        P99LatencyMsThreshold: !Ref P99LatencyMsThreshold
+        RollingAccuracyThreshold: !Ref RollingAccuracyThreshold
+        DriftDeltaPpThreshold: !Ref DriftDeltaPpThreshold
+        RunbookBaseUrl: !Ref RunbookBaseUrl
+
+  ConfigParamEndpointName:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub /sentiment/${Env}/endpoint_name
+      Type: String
+      Value: !GetAtt ComputeStack.Outputs.EndpointName
+  ConfigParamResultsTable:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub /sentiment/${Env}/results_table
+      Type: String
+      Value: !GetAtt StorageStack.Outputs.ResultsTableName
+  ConfigParamModelVersion:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub /sentiment/${Env}/model_version
+      Type: String
+      Value: !Ref ModelVersion
+  ConfigParamInputBucket:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub /sentiment/${Env}/input_bucket
+      Type: String
+      Value: !GetAtt StorageStack.Outputs.InputBucketName
+  ConfigParamAccuracyGate:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub /sentiment/${Env}/accuracy_gate
+      Type: String
+      Value: !Ref RollingAccuracyThreshold
+
+Outputs:
+  EndpointName:
+    Value: !GetAtt ComputeStack.Outputs.EndpointName
+    Export:
+      Name: !Sub ${AWS::StackName}-EndpointName
+  ResultsTableName:
+    Value: !GetAtt StorageStack.Outputs.ResultsTableName
+    Export:
+      Name: !Sub ${AWS::StackName}-ResultsTableName
+  InputBucketName:
+    Value: !GetAtt StorageStack.Outputs.InputBucketName
+    Export:
+      Name: !Sub ${AWS::StackName}-InputBucketName
+  AsyncOutputBucketName:
+    Value: !GetAtt StorageStack.Outputs.AsyncOutputBucketName
+    Export:
+      Name: !Sub ${AWS::StackName}-AsyncOutputBucketName
+  TopicP1Arn:
+    Value: !GetAtt ObservabilityStack.Outputs.TopicP1Arn
+  TopicP2Arn:
+    Value: !GetAtt ObservabilityStack.Outputs.TopicP2Arn
+  TopicP3Arn:
+    Value: !GetAtt ObservabilityStack.Outputs.TopicP3Arn

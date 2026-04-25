@@ -1,0 +1,126 @@
+name: ci-cd
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  id-token: write   # for OIDC -> AWS
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+  PROJECT: sentiment-aws
+
+jobs:
+  # ──────────────────────────────────────────────────────────────────
+  lint:
+    name: lint (ruff + cfn-lint)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+      - run: pip install ruff cfn-lint
+      - name: ruff
+        run: ruff check sentiment-aws --select E,F,I,UP --ignore E501
+      - name: cfn-lint
+        run: cfn-lint sentiment-aws/infra/root.yaml sentiment-aws/infra/stacks/*.yaml
+
+  unit-tests:
+    name: unit tests
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+      - run: pip install -r sentiment-aws/tests/requirements.txt
+      - run: pytest -q sentiment-aws/tests
+
+  # ──────────────────────────────────────────────────────────────────
+  deploy-dev:
+    name: deploy → dev
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: unit-tests
+    runs-on: ubuntu-latest
+    environment: dev
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_DEV }}
+          aws-region: ${{ env.AWS_REGION }}
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+      - run: pip install boto3
+      - name: deploy
+        env: { AWS_REGION: ${{ env.AWS_REGION }} }
+        run: bash sentiment-aws/scripts/deploy.sh dev
+      - name: integration smoke
+        env: { AWS_REGION: ${{ env.AWS_REGION }} }
+        run: |
+          INPUT=$(aws cloudformation describe-stacks --stack-name ${PROJECT}-dev \
+                   --query "Stacks[0].Outputs[?OutputKey=='InputBucketName'].OutputValue" --output text)
+          TABLE=$(aws cloudformation describe-stacks --stack-name ${PROJECT}-dev \
+                   --query "Stacks[0].Outputs[?OutputKey=='ResultsTableName'].OutputValue" --output text)
+          python sentiment-aws/scripts/latency_smoke_test.py \
+            --env dev --region $AWS_REGION \
+            --input-bucket "$INPUT" --results-table "$TABLE" \
+            --n 50 --p95-budget-ms 1200 --p99-budget-ms 2000
+
+  deploy-staging:
+    name: deploy → staging
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: deploy-dev
+    runs-on: ubuntu-latest
+    environment: staging
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_STAGING }}
+          aws-region: ${{ env.AWS_REGION }}
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+      - run: pip install boto3
+      - name: deploy
+        env: { AWS_REGION: ${{ env.AWS_REGION }} }
+        run: bash sentiment-aws/scripts/deploy.sh staging
+      - name: accuracy gate (>=0.78 on held-out batch)
+        env: { AWS_REGION: ${{ env.AWS_REGION }} }
+        run: |
+          pip install -r sentiment-aws/model/requirements.txt
+          aws s3 cp s3://${{ secrets.AWS_STAGING_ARTIFACTS_BUCKET }}/models/v1/model.tar.gz model.tar.gz
+          mkdir -p model && tar -xzf model.tar.gz -C model
+          python sentiment-aws/model/evaluate.py \
+            --model-path model/model.joblib \
+            --eval-csv sentiment-aws/tests/data/holdout.csv \
+            --report-path eval_report.json \
+            --min-accuracy 0.78 --fail-on-gate
+
+  deploy-prod:
+    name: deploy → prod
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: deploy-staging
+    runs-on: ubuntu-latest
+    environment:
+      name: prod
+      url: https://console.aws.amazon.com/cloudwatch/home?region=us-east-1#dashboards:
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_PROD }}
+          aws-region: ${{ env.AWS_REGION }}
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+      - run: pip install -r sentiment-aws/model/requirements.txt boto3
+      - name: promote (re-runs accuracy gate before prod deploy)
+        env:
+          AWS_REGION: ${{ env.AWS_REGION }}
+          EVAL_CSV: sentiment-aws/tests/data/holdout.csv
+          MIN_ACCURACY: "0.78"
+        run: bash sentiment-aws/scripts/promote.sh

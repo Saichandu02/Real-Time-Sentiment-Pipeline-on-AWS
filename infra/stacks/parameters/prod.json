@@ -1,0 +1,23 @@
+[
+  { "ParameterKey": "Env",                              "ParameterValue": "prod" },
+  { "ParameterKey": "ProjectName",                      "ParameterValue": "sentiment-aws" },
+  { "ParameterKey": "ArtifactsBucket",                  "ParameterValue": "REPLACE-ME-sentiment-artifacts-prod" },
+  { "ParameterKey": "TemplatesPrefix",                  "ParameterValue": "templates" },
+  { "ParameterKey": "ModelArtifactKey",                 "ParameterValue": "models/v1/model.tar.gz" },
+  { "ParameterKey": "ModelVersion",                     "ParameterValue": "v1" },
+  { "ParameterKey": "PreprocessLambdaKey",              "ParameterValue": "lambdas/preprocess.zip" },
+  { "ParameterKey": "PostprocessLambdaKey",             "ParameterValue": "lambdas/postprocess.zip" },
+  { "ParameterKey": "EndpointInstanceType",             "ParameterValue": "ml.m5.xlarge" },
+  { "ParameterKey": "EndpointMaxConcurrentInvocations", "ParameterValue": "16" },
+  { "ParameterKey": "EndpointMaxInstances",             "ParameterValue": "6" },
+  { "ParameterKey": "LogRetentionDays",                 "ParameterValue": "90" },
+  { "ParameterKey": "DDBPointInTimeRecovery",           "ParameterValue": "true" },
+  { "ParameterKey": "AlarmEmailP1",                     "ParameterValue": "pager-prod@example.com" },
+  { "ParameterKey": "AlarmEmailP2",                     "ParameterValue": "oncall-prod@example.com" },
+  { "ParameterKey": "AlarmEmailP3",                     "ParameterValue": "ml-eng@example.com" },
+  { "ParameterKey": "Endpoint5xxThresholdPct",          "ParameterValue": "5" },
+  { "ParameterKey": "P99LatencyMsThreshold",            "ParameterValue": "1500" },
+  { "ParameterKey": "RollingAccuracyThreshold",         "ParameterValue": "0.78" },
+  { "ParameterKey": "DriftDeltaPpThreshold",            "ParameterValue": "3" },
+  { "ParameterKey": "RunbookBaseUrl",                   "ParameterValue": "https://runbooks.example.com/sentiment/prod" }
+]

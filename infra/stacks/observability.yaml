@@ -1,0 +1,325 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Observability stack — severity-tiered SNS topics (P1/P2/P3) and CloudWatch
+  alarms covering endpoint health, latency, accuracy, and drift.
+
+Parameters:
+  Env:
+    Type: String
+  ProjectName:
+    Type: String
+  EndpointName:
+    Type: String
+  ResultsTableName:
+    Type: String
+  AlarmEmailP1:
+    Type: String
+  AlarmEmailP2:
+    Type: String
+  AlarmEmailP3:
+    Type: String
+    Default: ""
+  Endpoint5xxThresholdPct:
+    Type: Number
+    Default: 5
+  P99LatencyMsThreshold:
+    Type: Number
+    Default: 1500
+  RollingAccuracyThreshold:
+    Type: Number
+    Default: 0.78
+  DriftDeltaPpThreshold:
+    Type: Number
+    Default: 3
+  RunbookBaseUrl:
+    Type: String
+
+Conditions:
+  HasP3Email: !Not [!Equals [!Ref AlarmEmailP3, ""]]
+
+Resources:
+  TopicP1:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub ${ProjectName}-${Env}-p1-critical
+      DisplayName: !Sub Sentiment P1 (${Env})
+      Tags:
+        - { Key: Severity, Value: P1 }
+        - { Key: Service, Value: sentiment }
+        - { Key: Env, Value: !Ref Env }
+
+  TopicP2:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub ${ProjectName}-${Env}-p2-warning
+      DisplayName: !Sub Sentiment P2 (${Env})
+      Tags:
+        - { Key: Severity, Value: P2 }
+        - { Key: Service, Value: sentiment }
+        - { Key: Env, Value: !Ref Env }
+
+  TopicP3:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub ${ProjectName}-${Env}-p3-info
+      DisplayName: !Sub Sentiment P3 (${Env})
+      Tags:
+        - { Key: Severity, Value: P3 }
+        - { Key: Service, Value: sentiment }
+        - { Key: Env, Value: !Ref Env }
+
+  TopicP1Subscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref TopicP1
+      Protocol: email
+      Endpoint: !Ref AlarmEmailP1
+
+  TopicP2Subscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref TopicP2
+      Protocol: email
+      Endpoint: !Ref AlarmEmailP2
+
+  TopicP3Subscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasP3Email
+    Properties:
+      TopicArn: !Ref TopicP3
+      Protocol: email
+      Endpoint: !Ref AlarmEmailP3
+
+  ## ──────────────────────────────────────────────────────────────────────
+  ## P1 — sentiment-critical
+  ## ──────────────────────────────────────────────────────────────────────
+  AlarmEndpoint5xx:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${ProjectName}-${Env}-P1-endpoint-5xx
+      AlarmDescription: !Sub |
+        SageMaker endpoint 5xx error rate > ${Endpoint5xxThresholdPct}% over 2 consecutive minutes.
+        Runbook: ${RunbookBaseUrl}/endpoint-5xx
+      ActionsEnabled: true
+      AlarmActions: [!Ref TopicP1]
+      OKActions: [!Ref TopicP1]
+      EvaluationPeriods: 2
+      DatapointsToAlarm: 2
+      Threshold: !Ref Endpoint5xxThresholdPct
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      Metrics:
+        - Id: errors
+          MetricStat:
+            Metric:
+              Namespace: AWS/SageMaker
+              MetricName: Invocation5XXErrors
+              Dimensions:
+                - Name: EndpointName
+                  Value: !Ref EndpointName
+                - Name: VariantName
+                  Value: AllTraffic
+            Period: 60
+            Stat: Sum
+          ReturnData: false
+        - Id: invocations
+          MetricStat:
+            Metric:
+              Namespace: AWS/SageMaker
+              MetricName: Invocations
+              Dimensions:
+                - Name: EndpointName
+                  Value: !Ref EndpointName
+                - Name: VariantName
+                  Value: AllTraffic
+            Period: 60
+            Stat: Sum
+          ReturnData: false
+        - Id: error_pct
+          Expression: "IF(invocations > 0, 100*errors/invocations, 0)"
+          Label: 5xx error percentage
+          ReturnData: true
+      Tags:
+        - { Key: Severity, Value: P1 }
+        - { Key: Service, Value: sentiment }
+        - { Key: Env, Value: !Ref Env }
+
+  AlarmDDBThrottles:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${ProjectName}-${Env}-P1-ddb-throttles
+      AlarmDescription: !Sub |
+        DynamoDB throttles on results table > 10/min.
+        Runbook: ${RunbookBaseUrl}/ddb-throttles
+      ActionsEnabled: true
+      AlarmActions: [!Ref TopicP1]
+      OKActions: [!Ref TopicP1]
+      Namespace: AWS/DynamoDB
+      MetricName: ThrottledRequests
+      Dimensions:
+        - Name: TableName
+          Value: !Ref ResultsTableName
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 2
+      DatapointsToAlarm: 2
+      Threshold: 10
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      Tags:
+        - { Key: Severity, Value: P1 }
+        - { Key: Service, Value: sentiment }
+        - { Key: Env, Value: !Ref Env }
+
+  ## ──────────────────────────────────────────────────────────────────────
+  ## P2 — sentiment-warning
+  ## ──────────────────────────────────────────────────────────────────────
+  AlarmEndpointP99Latency:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${ProjectName}-${Env}-P2-p99-latency
+      AlarmDescription: !Sub |
+        End-to-end p99 latency > ${P99LatencyMsThreshold}ms for 5 minutes.
+        Runbook: ${RunbookBaseUrl}/latency
+      ActionsEnabled: true
+      AlarmActions: [!Ref TopicP2]
+      OKActions: [!Ref TopicP2]
+      Namespace: !Sub Sentiment/${Env}
+      MetricName: EndToEndLatencyMs
+      Dimensions:
+        - Name: Env
+          Value: !Ref Env
+      ExtendedStatistic: p99
+      Period: 60
+      EvaluationPeriods: 5
+      DatapointsToAlarm: 5
+      Threshold: !Ref P99LatencyMsThreshold
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      Tags:
+        - { Key: Severity, Value: P2 }
+        - { Key: Service, Value: sentiment }
+        - { Key: Env, Value: !Ref Env }
+
+  AlarmRollingAccuracy:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${ProjectName}-${Env}-P2-rolling-accuracy
+      AlarmDescription: !Sub |
+        Rolling accuracy on labeled feedback subset dropped below ${RollingAccuracyThreshold}.
+        Runbook: ${RunbookBaseUrl}/accuracy-drop
+      ActionsEnabled: true
+      AlarmActions: [!Ref TopicP2]
+      OKActions: [!Ref TopicP2]
+      Namespace: !Sub Sentiment/${Env}
+      MetricName: RollingAccuracy
+      Dimensions:
+        - Name: Env
+          Value: !Ref Env
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 3
+      DatapointsToAlarm: 2
+      Threshold: !Ref RollingAccuracyThreshold
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: missing
+      Tags:
+        - { Key: Severity, Value: P2 }
+        - { Key: Service, Value: sentiment }
+        - { Key: Env, Value: !Ref Env }
+
+  ## ──────────────────────────────────────────────────────────────────────
+  ## P3 — sentiment-info (drift)
+  ## ──────────────────────────────────────────────────────────────────────
+  AlarmDrift:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${ProjectName}-${Env}-P3-drift-signal
+      AlarmDescription: !Sub |
+        Concept drift detected: rolling-window accuracy delta > ${DriftDeltaPpThreshold} percentage points.
+        Runbook: ${RunbookBaseUrl}/drift
+      ActionsEnabled: true
+      AlarmActions: [!Ref TopicP3]
+      OKActions: [!Ref TopicP3]
+      Namespace: !Sub Sentiment/${Env}
+      MetricName: AccuracyDeltaPp
+      Dimensions:
+        - Name: Env
+          Value: !Ref Env
+      Statistic: Average
+      Period: 900
+      EvaluationPeriods: 2
+      DatapointsToAlarm: 2
+      Threshold: !Ref DriftDeltaPpThreshold
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      Tags:
+        - { Key: Severity, Value: P3 }
+        - { Key: Service, Value: sentiment }
+        - { Key: Env, Value: !Ref Env }
+
+  Dashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub ${ProjectName}-${Env}
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type":"metric","x":0,"y":0,"width":12,"height":6,
+              "properties":{
+                "title":"End-to-end latency (p50/p95/p99)",
+                "region":"${AWS::Region}",
+                "metrics":[
+                  ["Sentiment/${Env}","EndToEndLatencyMs","Env","${Env}",{"stat":"p50","label":"p50"}],
+                  ["...",{"stat":"p95","label":"p95"}],
+                  ["...",{"stat":"p99","label":"p99"}]
+                ],
+                "period":60,"yAxis":{"left":{"min":0}}
+              }
+            },
+            {
+              "type":"metric","x":12,"y":0,"width":12,"height":6,
+              "properties":{
+                "title":"Endpoint invocations / errors",
+                "region":"${AWS::Region}",
+                "metrics":[
+                  ["AWS/SageMaker","Invocations","EndpointName","${EndpointName}","VariantName","AllTraffic"],
+                  [".","Invocation4XXErrors",".",".",".","."],
+                  [".","Invocation5XXErrors",".",".",".","."]
+                ],
+                "period":60,"stat":"Sum"
+              }
+            },
+            {
+              "type":"metric","x":0,"y":6,"width":12,"height":6,
+              "properties":{
+                "title":"Predictions by sentiment",
+                "region":"${AWS::Region}",
+                "metrics":[
+                  ["Sentiment/${Env}","PredictionsBySentiment","Sentiment","positive","Env","${Env}"],
+                  ["...","Sentiment","negative",".","."]
+                ],
+                "period":300,"stat":"Sum","stacked":true
+              }
+            },
+            {
+              "type":"metric","x":12,"y":6,"width":12,"height":6,
+              "properties":{
+                "title":"Rolling accuracy & drift",
+                "region":"${AWS::Region}",
+                "metrics":[
+                  ["Sentiment/${Env}","RollingAccuracy","Env","${Env}"],
+                  [".","AccuracyDeltaPp",".","."]
+                ],
+                "period":300,"stat":"Average"
+              }
+            }
+          ]
+        }
+
+Outputs:
+  TopicP1Arn: { Value: !Ref TopicP1 }
+  TopicP2Arn: { Value: !Ref TopicP2 }
+  TopicP3Arn: { Value: !Ref TopicP3 }
+  DashboardName: { Value: !Ref Dashboard }

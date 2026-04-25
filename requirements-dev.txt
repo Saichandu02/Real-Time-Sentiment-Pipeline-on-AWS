@@ -1,0 +1,5 @@
+-r model/requirements.txt
+-r dashboard/requirements.txt
+-r tests/requirements.txt
+ruff>=0.4.0
+cfn-lint>=1.0.0
